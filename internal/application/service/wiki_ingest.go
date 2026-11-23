@@ -96,8 +96,7 @@ return proposed
 	// (one LLM modify call).
 	wikiSlugLockTTL = 5 * time.Minute
 	// wikiSlugLockWait / Poll bound how long a reduce goroutine blocks
-	// waiting for a contended slug before falling back to a best-effort
-	// skip (matching the pre-existing reduce-failure semantics).
+	// waiting for a contended slug before deferring its updates.
 	wikiSlugLockWait = 2 * time.Minute
 	wikiSlugLockPoll = 50 * time.Millisecond
 
@@ -361,15 +360,24 @@ type WikiPendingOp struct {
 	// slot. An op that outlived a reparse must not release a slot of the
 	// newer attempt. Zero on ops queued before this field existed.
 	Attempt int `json:"attempt,omitempty"`
-	// Retract fields
+	// Document metadata is used by retracts and resumed ingests.
 	DocTitle   string   `json:"doc_title,omitempty"`
 	DocSummary string   `json:"doc_summary,omitempty"`
 	PageSlugs  []string `json:"page_slugs,omitempty"`
 	FolderIDs  []string `json:"folder_ids,omitempty"`
 
+	ReduceRetry *wikiReduceRetry `json:"reduce_retry,omitempty"`
+
 	// dbID is set by peekPendingList from task_pending_ops.id. Zero in
 	// constructions made outside the queue (e.g. legacy tests).
 	dbID int64 `json:"-"`
+}
+
+// wikiReduceRetry holds the canonical updates that still need to land for this
+// pending row. Absence means the operation has yet to finish its map phase.
+type wikiReduceRetry struct {
+	Updates       []SlugUpdate        `json:"updates"`
+	TaxonomyPaths map[string][]string `json:"taxonomy_paths,omitempty"`
 }
 
 // wikiIngestService handles the LLM-powered wiki generation pipeline.
@@ -400,6 +408,7 @@ type wikiIngestService struct {
 	pendingRepo    interfaces.TaskPendingOpsRepository
 	deadLetterRepo interfaces.TaskDeadLetterRepository
 	redisClient    *redis.Client // nil in Lite mode (no Redis)
+	slugLockWait   time.Duration // zero uses wikiSlugLockWait
 	// spanTracker lets per-document map work surface as a
 	// postprocess.wiki subspan in the knowledge trace tree. Async
 	// batch design means we look up the parent attempt by knowledge
@@ -990,9 +999,8 @@ func (s *wikiIngestService) claimPendingList(ctx context.Context, kbID string, l
 //
 // Redis mode only: in Lite mode a single process runs one batch per KB at a
 // time (liteLocks), so same-slug contention cannot occur and fn runs
-// directly. Returns (false, nil) if the lock could not be acquired within
-// wikiSlugLockWait — the caller then treats the slug like a best-effort
-// reduce miss (matching pre-existing reduce-failure handling). On a Redis
+// directly. Returns (false, nil) if the wait for a contended lock expires,
+// allowing the caller to defer the slug without spending a retry. On a Redis
 // error we fail OPEN (run fn unlocked): a rare lost-update on a shared page
 // is tolerated by the finalize/dead-link passes, whereas silently dropping
 // the update is strictly worse.
@@ -1001,10 +1009,17 @@ func (s *wikiIngestService) withSlugLock(ctx context.Context, kbID, slug string,
 		return true, fn()
 	}
 	key := wikiSlugLockPrefix + kbID + ":" + slug
-	deadline := time.Now().Add(wikiSlugLockWait)
+	wait := s.slugLockWait
+	if wait == 0 {
+		wait = wikiSlugLockWait
+	}
+	deadline := time.Now().Add(wait)
 	for {
 		ok, rerr := s.redisClient.SetNX(ctx, key, "1", wikiSlugLockTTL).Result()
 		if rerr != nil {
+			if ctx.Err() != nil {
+				return false, ctx.Err()
+			}
 			logger.Warnf(ctx, "wiki reduce: slug lock SetNX failed for %s: %v (running unlocked)", slug, rerr)
 			return true, fn()
 		}
@@ -1388,6 +1403,8 @@ type wikiIngestPageRef struct {
 }
 
 type docIngestResult struct {
+	pendingOpID int64
+	attempt     int
 	KnowledgeID string
 	DocTitle    string
 	Summary     string // one-line summary of the document (from summary page)
@@ -1506,6 +1523,9 @@ type SlugUpdate struct {
 	// product page). The one-line headline alone was too terse to keep the
 	// editor grounded on longer / multi-topic source documents.
 	DocSummary string
+
+	// Restored from the enclosing queue row each time updates enter a batch.
+	pendingOpID int64
 }
 
 func previewText(s string, maxRunes int) string {

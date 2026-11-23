@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"strings"
 	"sync"
@@ -606,6 +607,10 @@ func (r *wikiPendingRepoForCleanupTest) ReleaseByIDs(ctx context.Context, _ []in
 	if r.releaseErr != nil {
 		return r.releaseErr
 	}
+	return nil
+}
+
+func (*wikiPendingRepoForCleanupTest) UpdatePayload(context.Context, int64, json.RawMessage) error {
 	return nil
 }
 

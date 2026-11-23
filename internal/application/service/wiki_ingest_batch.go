@@ -516,15 +516,6 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 	}
 
 	logger.Infof(ctx, "wiki ingest: batch processing %d ops for KB %s", len(pendingOps), payload.KnowledgeBaseID)
-	// The parse attempt each document's op was queued under, for the slot
-	// release after reduce (see finalizeWikiSubtask).
-	opAttempts := make(map[string]int, len(pendingOps))
-	for _, op := range pendingOps {
-		if op.Op == WikiOpIngest {
-			opAttempts[op.KnowledgeID] = op.Attempt
-		}
-	}
-
 	// Crash/abort safety net (standard/claim mode only). If this batch exits
 	// abnormally — panic, ctx timeout, or an early error return — BEFORE it
 	// settles its claimed rows (trim + requeueFailedOps), release the claims
@@ -534,6 +525,7 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 	// bounded detached cleanup context because ctx may already be cancelled on
 	// the timeout path. Ordinary Lite batches peek without claiming.
 	claimsSettled := false
+	claimedIDsToRelease := peekedIDs
 	if (s.redisClient != nil || payload.KnowledgeID != "") && len(peekedIDs) > 0 {
 		defer func() {
 			if claimsSettled {
@@ -541,11 +533,13 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 			}
 			releaseCtx, releaseCancel := wikiIngestCleanupContext(ctx)
 			defer releaseCancel()
-			if err := s.pendingRepo.ReleaseByIDs(releaseCtx, peekedIDs); err != nil {
-				logger.Warnf(ctx, "wiki ingest: failed to release %d claims on abnormal exit for KB %s: %v", len(peekedIDs), payload.KnowledgeBaseID, err)
+			if err := s.pendingRepo.ReleaseByIDs(releaseCtx, claimedIDsToRelease); err != nil {
+				logger.Warnf(ctx, "wiki ingest: failed to release %d claims on abnormal exit for KB %s: %v",
+					len(claimedIDsToRelease), payload.KnowledgeBaseID, err)
 				return
 			}
-			logger.Warnf(ctx, "wiki ingest: released %d claimed rows on abnormal exit for KB %s (re-claimable immediately)", len(peekedIDs), payload.KnowledgeBaseID)
+			logger.Warnf(ctx, "wiki ingest: released %d claimed rows on abnormal exit for KB %s",
+				len(claimedIDsToRelease), payload.KnowledgeBaseID)
 		}()
 	}
 
@@ -563,9 +557,25 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 	// 1. MAP PHASE (Parallel extraction and generation of updates)
 	var mapMu sync.Mutex
 	var failedOps []WikiPendingOp
-	slugUpdates := make(map[string][]SlugUpdate)
 	var docResults []*docIngestResult
+	slugUpdates := make(map[string][]SlugUpdate)
+	resumedUpdates := make(map[string][]SlugUpdate)
+	categoryPaths := make(map[string][]string)
 	var retractFolderIDs []string
+	// The enclosing row ID survives in-batch remapping and distinguishes
+	// retracts that have no knowledge ID.
+	addUpdates := func(target map[string][]SlugUpdate, rowID int64, updates []SlugUpdate) {
+		for _, u := range updates {
+			u.pendingOpID = rowID
+			target[u.Slug] = append(target[u.Slug], u)
+		}
+	}
+	addResumedUpdates := func(op WikiPendingOp) {
+		addUpdates(resumedUpdates, op.dbID, op.ReduceRetry.Updates)
+		for slug, path := range op.ReduceRetry.TaxonomyPaths {
+			categoryPaths[slug] = path
+		}
+	}
 	// rateLimited flips true when any map/reduce LLM failure looks like an
 	// upstream 429/quota trip. It steers the follow-up scheduler onto the
 	// longer wikiRateLimitBackoff so retries don't keep hammering an already
@@ -580,6 +590,14 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 		op := op
 		eg.Go(func() error {
 			if op.Op == WikiOpRetract {
+				if op.ReduceRetry != nil {
+					mapMu.Lock()
+					retractOps++
+					retractHandled++
+					addResumedUpdates(op)
+					mapMu.Unlock()
+					return nil
+				}
 				// Resolve the authoritative page set at run-time. The caller
 				// (knowledgeService.cleanupWikiOnKnowledgeDelete) captures
 				// PageSlugs from a DB snapshot taken *before* this task fires,
@@ -643,6 +661,7 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 						DocTitle:          op.DocTitle,
 						KnowledgeID:       op.KnowledgeID,
 						Language:          types.ResolveLanguageName(ctx, op.Language),
+						pendingOpID:       op.dbID,
 					})
 				}
 				for folderID := range folderSet {
@@ -674,10 +693,14 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 			if result != nil {
 				mapMu.Lock()
 				ingestSucceeded++
+				result.pendingOpID = op.dbID
+				result.attempt = op.Attempt
 				docResults = append(docResults, result)
 				docPreview = append(docPreview, fmt.Sprintf("ingest[%s]: title=%s summary=%s", previewText(result.KnowledgeID, 24), previewText(result.DocTitle, 40), previewText(result.Summary, 64)))
-				for _, u := range updates {
-					slugUpdates[u.Slug] = append(slugUpdates[u.Slug], u)
+				if op.ReduceRetry != nil {
+					addResumedUpdates(op)
+				} else {
+					addUpdates(slugUpdates, op.dbID, updates)
 				}
 				mapMu.Unlock()
 
@@ -718,8 +741,16 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 	// single pass assigns every new entity/concept slug a coherent category_path
 	// that reuses existing folders. Reduce then only applies the plan to pages
 	// that don't already have a category (user-curated pages are never churned).
-	batchCtx.PlannedFolderID = s.resolvePlannedFolders(ctx, kb,
-		s.planBatchTaxonomy(ctx, chatModel, kb, slugUpdates, lang))
+	for slug, path := range s.planBatchTaxonomy(ctx, chatModel, kb, slugUpdates, lang) {
+		categoryPaths[slug] = path
+	}
+	batchCtx.PlannedFolderID = s.resolvePlannedFolders(ctx, kb, categoryPaths)
+
+	// Resumed updates already went through identity remapping and taxonomy
+	// planning in the batch that produced them.
+	for slug, updates := range resumedUpdates {
+		slugUpdates[slug] = append(slugUpdates[slug], updates...)
+	}
 
 	// 2. REDUCE PHASE (Parallel upserting grouped by Slug)
 	egReduce, reduceCtx := errgroup.WithContext(ctx)
@@ -735,26 +766,24 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 	// references from the same batch's summary pages and exclude failed
 	// pages from finalize processing.
 	failedAdditionSlugs := make(map[string]struct{})
-	// unappliedSlugKIDs collects the knowledge_ids that contributed to a
-	// slug whose update never landed — either because we could NOT acquire
-	// the per-slug lock within wikiSlugLockWait, or because reduce returned
-	// an error. In both cases the page keeps its prior content, so the
-	// owning document(s) must be re-queued rather than trimmed — otherwise
-	// the row is deleted and the contribution is silently lost forever
-	// (finalize only rebuilds the index / cross-links, it does not re-run
-	// reduce). requeueFailedOps' fail_count budget bounds the retries and
-	// dead-letters a document whose slug fails/stays hot permanently.
-	unappliedSlugKIDs := make(map[string]struct{})
-	// collectUnapplied records every knowledge_id backing a slug we failed
-	// to apply. Caller holds no lock; it takes reduceMu itself.
-	collectUnapplied := func(updates []SlugUpdate) {
+	// Keep only the updates whose slug did not land, grouped by queue row.
+	// A row spends one failure only if at least one of its slugs really failed.
+	type reduceRemainder struct {
+		updates []SlugUpdate
+		failed  bool
+	}
+	remainingByOp := make(map[int64]reduceRemainder)
+	unappliedSlugs := make(map[string]struct{})
+	collectUnapplied := func(slug string, updates []SlugUpdate, failed bool) {
 		reduceMu.Lock()
+		defer reduceMu.Unlock()
+		unappliedSlugs[slug] = struct{}{}
 		for _, u := range updates {
-			if u.KnowledgeID != "" {
-				unappliedSlugKIDs[u.KnowledgeID] = struct{}{}
-			}
+			remaining := remainingByOp[u.pendingOpID]
+			remaining.updates = append(remaining.updates, u)
+			remaining.failed = remaining.failed || failed
+			remainingByOp[u.pendingOpID] = remaining
 		}
-		reduceMu.Unlock()
 	}
 
 	// Build the kid → wikiSpan lookup before kicking off reduce. Each
@@ -795,40 +824,25 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 				// 归并失败交给下方统一分类；这里仅返回获取锁的错误。
 				return nil
 			})
-			if lockErr != nil {
-				collectUnapplied(updates)
-				// ctx cancelled (batch timeout / shutdown) — stop quietly.
+			switch {
+			case lockErr != nil:
+				// Cancellation while waiting for the lock did not run reduce.
+				collectUnapplied(slug, updates, false)
 				return nil
-			}
-			if !acquired {
-				// Contended slug we couldn't get in time. The page keeps its
-				// prior content, so the documents that fed this slug are NOT
-				// done: record their knowledge_ids so the trim phase re-queues
-				// them (via the failed-op retry budget) for a later,
-				// hopefully-uncontended batch instead of deleting their rows.
-				logger.Warnf(reduceCtx, "wiki ingest: slug %s busy > %s, deferring update", slug, wikiSlugLockWait)
-				collectUnapplied(updates)
+			case !acquired:
+				logger.Warnf(reduceCtx, "wiki ingest: slug %s busy, deferring update", slug)
+				collectUnapplied(slug, updates, false)
 				return nil
-			}
-			if updateDeferred {
-				// The page kept its previous body because the rewrite dropped
-				// table rows that are still on it. Not an error and the page is
-				// not damaged, but this slug's contribution never landed, so the
-				// documents behind it must survive the trim phase and come back
-				// in a later batch — trimming them here would delete their
-				// pending row and lose the addition for good.
+			case updateDeferred:
+				// A row-guard refusal kept the previous content. Keep the
+				// existing bounded retry policy for rejected rewrites.
 				logger.Warnf(reduceCtx,
-					"wiki ingest: slug %s kept its previous content (rewrite dropped rows), deferring update",
-					slug)
-				collectUnapplied(updates)
-			}
-			if reduceErr != nil {
-				// The page's read-modify-write failed, so this slug's update
-				// never landed. Re-queue the contributing documents (same
-				// fail_count budget as a map failure) so a later batch retries
-				// instead of silently dropping the row at trim time.
+					"wiki ingest: slug %s kept its previous content (rewrite dropped rows), deferring update", slug)
+				collectUnapplied(slug, updates, true)
+				return nil
+			case reduceErr != nil:
 				logger.Warnf(reduceCtx, "wiki ingest: reduce failed for slug %s: %v", slug, reduceErr)
-				collectUnapplied(updates)
+				collectUnapplied(slug, updates, true)
 				if isLikelyRateLimitError(reduceErr) {
 					reduceMu.Lock()
 					rateLimited = true
@@ -870,18 +884,28 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 
 	totalPagesAffected = len(allPagesAffected)
 
-	// Project one bounded summary into the knowledge-base activity feed.
-	// Detailed per-document Wiki log rows duplicated that feed and were never
-	// consumed by retrieval, so the activity record is now written directly.
+	// Resumed rows have already handed off their document-level changes.
+	// Finalize still receives the pages that landed on this pass.
+	resultsByOp := make(map[int64]*docIngestResult, len(docResults))
+	for _, result := range docResults {
+		resultsByOp[result.pendingOpID] = result
+	}
 	wikiActivityActions := make(map[string]int, 2)
+	changes := make([]wikiFinalizeChange, 0, len(pendingOps))
 	for _, op := range pendingOps {
+		if op.ReduceRetry != nil {
+			continue
+		}
 		if op.Op == WikiOpRetract {
 			wikiActivityActions["retract"]++
-		}
-	}
-	for _, r := range docResults {
-		if r != nil {
+			changes = append(changes, wikiFinalizeChange{
+				Action: wikiFinalizeRemoved, DocTitle: op.DocTitle, DocSummary: op.DocSummary,
+			})
+		} else if result := resultsByOp[op.dbID]; result != nil {
 			wikiActivityActions["ingest"]++
+			changes = append(changes, wikiFinalizeChange{
+				Action: wikiFinalizeAdded, DocTitle: result.DocTitle, DocSummary: result.Summary,
+			})
 		}
 	}
 	RecordWikiContentActivity(tailCtx, s.audit, payload.TenantID, payload.KnowledgeBaseID, wikiActivityActions)
@@ -912,26 +936,13 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 			if p.Slug == "" || p.Title == "" {
 				continue
 			}
-			if _, bad := failedAdditionSlugs[p.Slug]; bad {
+			if _, bad := unappliedSlugs[p.Slug]; bad {
 				continue
 			}
 			freshTitleBySlug[p.Slug] = p.Title
 		}
 	}
-	if len(allPagesAffected) > 0 || len(docResults) > 0 || retractHandled > 0 || len(retractFolderIDs) > 0 {
-		changes := make([]wikiFinalizeChange, 0, len(docResults)+len(pendingOps))
-		for _, r := range docResults {
-			changes = append(changes, wikiFinalizeChange{
-				Action: wikiFinalizeAdded, DocTitle: r.DocTitle, DocSummary: r.Summary,
-			})
-		}
-		for _, op := range pendingOps {
-			if op.Op == WikiOpRetract {
-				changes = append(changes, wikiFinalizeChange{
-					Action: wikiFinalizeRemoved, DocTitle: op.DocTitle, DocSummary: op.DocSummary,
-				})
-			}
-		}
+	if len(allPagesAffected) > 0 || len(changes) > 0 || len(retractFolderIDs) > 0 {
 		var enqueueErr error
 		finalizeRowsFailed, enqueueErr = s.enqueueFinalize(
 			ctx, payload, allPagesAffected, freshTitleBySlug, changes, retractFolderIDs)
@@ -950,6 +961,56 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 		}
 	}
 
+	// Checkpoint after the finalize handoff is durable and before releasing
+	// claims. A retry on another worker reads just these unapplied updates.
+	checkpointCtx, checkpointCancel := wikiIngestCleanupContext(ctx)
+	defer checkpointCancel()
+	var deferredIDs []int64
+	for _, op := range pendingOps {
+		remaining, keep := remainingByOp[op.dbID]
+		if !keep {
+			continue
+		}
+		// If all resumed updates are still pending, the persisted payload is
+		// already correct. In particular, repeated lock misses need no write.
+		if op.ReduceRetry == nil || len(op.ReduceRetry.Updates) != len(remaining.updates) {
+			op.ReduceRetry = &wikiReduceRetry{
+				Updates: remaining.updates, TaxonomyPaths: make(map[string][]string),
+			}
+			for _, update := range remaining.updates {
+				if path, ok := categoryPaths[update.Slug]; ok {
+					op.ReduceRetry.TaxonomyPaths[update.Slug] = path
+				}
+			}
+			if result := resultsByOp[op.dbID]; result != nil {
+				op.DocTitle = result.DocTitle
+				op.DocSummary = result.Summary
+			}
+			data, err := json.Marshal(op)
+			if err == nil {
+				err = s.pendingRepo.UpdatePayload(checkpointCtx, op.dbID, data)
+			}
+			if err != nil {
+				exitStatus = "checkpoint_failed"
+				failCtx, failCancel := wikiIngestCleanupContext(ctx)
+				for _, result := range docResults {
+					if result.WikiSpan != nil {
+						s.tracker().FailSpan(failCtx, result.WikiSpan, "REDUCE_CHECKPOINT_FAILED", err.Error(), err)
+					}
+				}
+				failCancel()
+				return fmt.Errorf("wiki ingest: checkpoint pending op %d: %w", op.dbID, err)
+			}
+		}
+		if remaining.failed {
+			failedOps = append(failedOps, op)
+		} else {
+			deferredIDs = append(deferredIDs, op.dbID)
+		}
+	}
+
+	checkpointCancel()
+
 	// Close postprocess.wiki spans for every successfully-mapped doc.
 	// Span duration now spans map + reduce + index rebuild + cleanup +
 	// cross-link injection + publish, matching the wall-clock window
@@ -958,7 +1019,7 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 	// trace viewer can show how many of the doc's extracted pages
 	// actually landed (vs. dropped because reduce-phase generation
 	// failed).
-	failedAdditionSlugCount := len(failedAdditionSlugs)
+	failedSlugCount := len(unappliedSlugs)
 	spanCtx, spanCancel := wikiIngestCleanupContext(ctx)
 	for _, r := range docResults {
 		if r == nil {
@@ -975,8 +1036,8 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 		// error): those are re-queued below, so keep their finalizing slot
 		// held — the retry (or the dead-letter drain in requeueFailedOps)
 		// releases it once the op reaches a real terminal state.
-		if _, unapplied := unappliedSlugKIDs[r.KnowledgeID]; !unapplied {
-			s.finalizeWikiSubtask(ctx, r.KnowledgeID, opAttempts[r.KnowledgeID])
+		if _, unapplied := remainingByOp[r.pendingOpID]; !unapplied {
+			s.finalizeWikiSubtask(ctx, r.KnowledgeID, r.attempt)
 		}
 		if r.WikiSpan == nil {
 			continue
@@ -988,7 +1049,7 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 				"slug":  p.Slug,
 				"title": previewText(p.Title, 80),
 			}
-			if _, bad := failedAdditionSlugs[p.Slug]; bad {
+			if _, bad := unappliedSlugs[p.Slug]; bad {
 				droppedPages = append(droppedPages, entry)
 				continue
 			}
@@ -998,7 +1059,7 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 			"pages_written":         len(writtenPages),
 			"pages_dropped":         len(droppedPages),
 			"pages_total":           len(r.Pages),
-			"failed_slug_writes":    failedAdditionSlugCount,
+			"failed_slug_writes":    failedSlugCount,
 			"pages_written_preview": writtenPages,
 		}
 		if len(droppedPages) > 0 {
@@ -1014,48 +1075,24 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 	// mapOneDocument (the failedOps path returns before reaching
 	// docResults). Nothing extra to do here for them.
 
-	// Fold documents with an unapplied slug (contended lock or reduce error)
-	// into failedOps so they are neither trimmed nor promoted to completed:
-	// requeueFailedOps then runs them through the same fail_count budget
-	// (retry now, dead-letter once the slug stays permanently hot/broken) as
-	// a map-phase failure. A doc already counted as a map failure is skipped
-	// to avoid a double fail_count bump.
-	if len(unappliedSlugKIDs) > 0 {
-		failedKIDs := make(map[string]struct{}, len(failedOps))
-		for _, op := range failedOps {
-			failedKIDs[op.KnowledgeID] = struct{}{}
-		}
-		for _, op := range pendingOps {
-			if _, unapplied := unappliedSlugKIDs[op.KnowledgeID]; !unapplied {
-				continue
-			}
-			if _, already := failedKIDs[op.KnowledgeID]; already {
-				continue
-			}
-			failedOps = append(failedOps, op)
-			failedKIDs[op.KnowledgeID] = struct{}{}
-		}
-	}
-
-	// Build the trim set: rows that should be removed from
-	// task_pending_ops. We start from the full peekedIDs (every row we
-	// pulled, even ones de-duplicated by knowledge_id) and subtract
-	// any failed op's dbID — those need to stay in place so the
-	// requeueFailedOps path can decide between retry and dead-letter.
-	failedIDSet := make(map[int64]struct{}, len(failedOps))
+	// Keep rows with map errors or unapplied reduce updates. Trim every other
+	// row, including older duplicates consumed by decodePendingRows.
+	keptIDs := make(map[int64]struct{}, len(failedOps)+len(deferredIDs))
 	for _, op := range failedOps {
-		if op.dbID != 0 {
-			failedIDSet[op.dbID] = struct{}{}
-		}
+		keptIDs[op.dbID] = struct{}{}
+	}
+	for _, id := range deferredIDs {
+		keptIDs[id] = struct{}{}
 	}
 	trimIDs := make([]int64, 0, len(peekedIDs))
 	for _, id := range peekedIDs {
-		if _, fail := failedIDSet[id]; fail {
+		if _, keep := keptIDs[id]; keep {
 			continue
 		}
 		trimIDs = append(trimIDs, id)
 	}
 	settleCtx, settleCancel := wikiIngestCleanupContext(ctx)
+	defer settleCancel()
 	trimErr := s.trimPendingList(settleCtx, trimIDs)
 
 	// Process failed ops: increment fail_count and dead-letter once
@@ -1066,10 +1103,18 @@ func (s *wikiIngestService) ProcessWikiIngest(ctx context.Context, t *asynq.Task
 	if len(failedOps) > 0 {
 		requeueErr = s.requeueFailedOps(settleCtx, payload, failedOps)
 	}
-	settleCancel()
 	if err := errors.Join(trimErr, requeueErr); err != nil {
 		exitStatus = "settle_failed"
 		return fmt.Errorf("wiki ingest: settle claimed rows: %w", err)
+	}
+	// Failed rows have already been released or removed, and another worker
+	// may have claimed them. Cleanup after this point only owns the deferrals.
+	claimedIDsToRelease = deferredIDs
+	if len(deferredIDs) > 0 {
+		if err := s.pendingRepo.ReleaseByIDs(settleCtx, deferredIDs); err != nil {
+			exitStatus = "settle_failed"
+			return fmt.Errorf("wiki ingest: release contended slug ops: %w", err)
+		}
 	}
 	// All claimed rows have now reached a terminal state (deleted on success,
 	// released for retry, or dead-lettered), so disarm the abnormal-exit
@@ -1375,7 +1420,36 @@ func (s *wikiIngestService) mapOneDocumentRecovered(
 			result, updates, err = nil, nil, fmt.Errorf("wiki map panicked: %v", r)
 		}
 	}()
-	return s.mapOneDocument(ctx, chatModel, payload, op, batchCtx)
+	if op.ReduceRetry == nil {
+		return s.mapOneDocument(ctx, chatModel, payload, op, batchCtx)
+	}
+	// Cached updates belong to the parse attempt that created them. Check
+	// liveness before replaying any part of a reparse swap (including retracts).
+	if attemptSuperseded(ctx, s.tracker(), op.KnowledgeID, op.Attempt) {
+		return nil, nil, nil
+	}
+	gone, err := s.isKnowledgeGone(ctx, payload.KnowledgeBaseID, op.KnowledgeID)
+	if err != nil || gone {
+		return nil, nil, err
+	}
+	result = &docIngestResult{
+		KnowledgeID: op.KnowledgeID,
+		DocTitle:    op.DocTitle,
+		Summary:     op.DocSummary,
+		WikiSpan: s.beginWikiSubspan(ctx, op.KnowledgeID, types.JSONMap{
+			"knowledge_base_id": payload.KnowledgeBaseID,
+			"resumed_reduce":    true,
+		}),
+	}
+	for _, update := range op.ReduceRetry.Updates {
+		switch update.Type {
+		case types.WikiPageTypeSummary:
+			result.Pages = append(result.Pages, wikiIngestPageRef{Slug: update.Slug, Title: update.DocTitle})
+		case types.WikiPageTypeEntity, types.WikiPageTypeConcept:
+			result.Pages = append(result.Pages, wikiIngestPageRef{Slug: update.Slug, Title: update.Item.Name})
+		}
+	}
+	return result, op.ReduceRetry.Updates, nil
 }
 
 func (s *wikiIngestService) mapOneDocument(

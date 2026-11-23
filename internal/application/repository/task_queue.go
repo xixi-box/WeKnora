@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -408,6 +409,13 @@ func (r *taskPendingOpsRepository) ReleaseByIDs(ctx context.Context, ids []int64
 		Model(&types.TaskPendingOp{}).
 		Where("id IN ?", ids).
 		Update("claimed_at", nil).Error
+}
+
+func (r *taskPendingOpsRepository) UpdatePayload(ctx context.Context, id int64, payload json.RawMessage) error {
+	return r.db.WithContext(ctx).
+		Model(&types.TaskPendingOp{}).
+		Where("id = ?", id).
+		Update("payload", payload).Error
 }
 
 // DeleteByIDs removes the given rows in one statement. Empty input is a

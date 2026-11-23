@@ -2,6 +2,7 @@ package interfaces
 
 import (
 	"context"
+	"encoding/json"
 	"time"
 
 	"github.com/Tencent/WeKnora/internal/types"
@@ -60,6 +61,10 @@ type TaskPendingOpsRepository interface {
 	// to re-queue a transiently-failed op without waiting for its claim to
 	// go stale. Harmless on rows that were never claimed (Lite mode).
 	ReleaseByIDs(ctx context.Context, ids []int64) error
+
+	// UpdatePayload checkpoints consumer progress on the existing row without
+	// releasing the claim or changing its retry count.
+	UpdatePayload(ctx context.Context, id int64, payload json.RawMessage) error
 
 	// DeleteByIDs removes the given rows. No-op for empty input. Used
 	// to consume a successfully-processed batch, and to drop ops that
